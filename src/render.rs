@@ -1,6 +1,5 @@
-use std::collections::HashSet;
-use std::ops::Deref;
 use std::sync::Arc;
+use hex_color::HexColor;
 use vulkano::buffer::{Buffer, BufferCreateInfo, BufferUsage, BufferContents, Subbuffer};
 use vulkano::command_buffer::allocator::{StandardCommandBufferAllocator, StandardCommandBufferAllocatorCreateInfo};
 use vulkano::command_buffer::{AutoCommandBufferBuilder, CommandBufferUsage, CopyImageToBufferInfo, RenderPassBeginInfo, SubpassBeginInfo, SubpassContents, SubpassEndInfo};
@@ -30,15 +29,16 @@ use vulkano::shader::EntryPoint;
 
 #[derive(BufferContents, Default, Copy, Clone)]
 #[repr(C, align(16))]
-pub struct SpawnData {
+struct SpawnData {
     pub world_pos: [f32; 3],
 }
 
 #[derive(BufferContents)]
 #[repr(C, align(16))]
-pub struct UniformData {
+struct UniformData {
     pub spawn_count: u32,
     pub spawns: [SpawnData; 256],
+    pub randoms_color: [f32; 4],
 }
 
 #[derive(BufferContents, Vertex)]
@@ -73,7 +73,7 @@ pub struct LmRenderer {
 const OUTPUT_IMAGE_FORMAT: Format = Format::R5G6B5_UNORM_PACK16;
 
 impl LmRenderer {
-    pub fn init(spawns: Vec<[f32; 3]>) -> LmRenderer {
+    pub fn init(spawns: Vec<[f32; 3]>, randoms_color: HexColor) -> LmRenderer {
         let library = VulkanLibrary::new().expect("No Vulkan library present");
         let instance = Instance::new(library, InstanceCreateInfo {
             flags: InstanceCreateFlags::ENUMERATE_PORTABILITY,
@@ -115,7 +115,7 @@ impl LmRenderer {
         let descriptor_set_allocator = StandardDescriptorSetAllocator::new(device.clone(), StandardDescriptorSetAllocatorCreateInfo::default());
 
         let uniform_buffer = create_buffer(
-            create_uniform_data(&spawns),
+            create_uniform_data(&spawns, randoms_color),
             BufferUsage::UNIFORM_BUFFER,
             MemoryTypeFilter::HOST_SEQUENTIAL_WRITE | MemoryTypeFilter::PREFER_DEVICE,
             memory_allocator.clone()
@@ -209,7 +209,6 @@ impl LmRenderer {
     }
 
     pub fn render_randoms(&self, lm_verts: Vec<Vert>, lm_indices: Vec<u16>, dimensions: &Dimensions) -> Vec<u8> {
-        let num_lm_verts = lm_verts.len() as u32;
         let num_lm_indices = lm_indices.len() as u32;
 
         let vertex_buffer = create_buffer_iter(
@@ -316,10 +315,16 @@ impl LmRenderer {
     }
 }
 
-fn create_uniform_data(spawns: &[[f32; 3]]) -> UniformData {
+fn create_uniform_data(spawns: &[[f32; 3]], randoms_color: HexColor) -> UniformData {
     let mut data = UniformData {
         spawn_count: spawns.len() as u32,
-        spawns: [SpawnData::default(); 256]
+        spawns: [SpawnData::default(); 256],
+        randoms_color: [
+            (randoms_color.r as f32 / 255.0),
+            (randoms_color.g as f32 / 255.0),
+            (randoms_color.b as f32 / 255.0),
+            (randoms_color.a as f32 / 255.0),
+        ],
     };
     spawns.iter().enumerate().for_each(|(i, s)| {
         data.spawns[i].world_pos = s.clone();

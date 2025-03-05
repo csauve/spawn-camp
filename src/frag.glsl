@@ -12,6 +12,7 @@ struct SpawnData {
 layout(set = 0, binding = 0, std140) uniform UniformData {
     uint spawn_count;
     SpawnData spawns[256];
+    vec4 randoms_color;
 } data;
 
 bool is_random() {
@@ -30,6 +31,10 @@ void main() {
 //    float direct_light = clamp(dot(v_world_normal, sun), 0.0, 1.0);
 //    float light = direct_light + 0.2;
 
-    vec3 spawn_color = is_random() ? vec3(1.0, 0.5, 0.5) : vec3(1.0, 1.0, 1.0);
-    f_color = vec4(spawn_color, 1.0);
+    vec3 lm = vec3(1.0);
+    if (is_random()) {
+        lm = mix(lm, lm * vec3(data.randoms_color.rgb), data.randoms_color.a);
+    }
+
+    f_color = vec4(lm, 1.0);
 }

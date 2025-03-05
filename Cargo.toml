@@ -5,10 +5,8 @@ edition = "2021"
 
 [dependencies]
 ringhopper = { git = "https://github.com/FishAndRips/ringhopper" }
-ringhopper-engines = { git = "https://github.com/FishAndRips/ringhopper" }
-#png = { workspace = true }
 vulkano = "0.34.1"
-image = "0.24"
 vulkano-shaders = "0.34.0"
-vulkano-util = "0.34.1"
-#winit = { workspace = true, default-features = true }
+clap = "4.5.31"
+hex_color = "3.0.0"
+colored = "3.0.0"
