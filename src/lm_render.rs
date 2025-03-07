@@ -1,8 +1,9 @@
 use std::sync::Arc;
 use hex_color::HexColor;
+use ringhopper::definitions::BitmapDataFormat;
 use vulkano::buffer::{Buffer, BufferCreateInfo, BufferUsage, BufferContents, Subbuffer};
 use vulkano::command_buffer::allocator::{StandardCommandBufferAllocator, StandardCommandBufferAllocatorCreateInfo};
-use vulkano::command_buffer::{AutoCommandBufferBuilder, CommandBufferUsage, CopyImageToBufferInfo, RenderPassBeginInfo, SubpassBeginInfo, SubpassContents, SubpassEndInfo};
+use vulkano::command_buffer::{AutoCommandBufferBuilder, BlitImageInfo, CommandBufferUsage, CopyBufferToImageInfo, CopyImageToBufferInfo, RenderPassBeginInfo, SubpassBeginInfo, SubpassContents, SubpassEndInfo};
 use vulkano::device::{Device, DeviceCreateInfo, Queue, QueueCreateInfo, QueueFlags};
 use vulkano::instance::{Instance, InstanceCreateFlags, InstanceCreateInfo};
 use vulkano::memory::allocator::{AllocationCreateInfo, MemoryAllocator, MemoryTypeFilter, StandardMemoryAllocator};
@@ -17,6 +18,7 @@ use vulkano::descriptor_set::{PersistentDescriptorSet, WriteDescriptorSet};
 use vulkano::descriptor_set::allocator::{StandardDescriptorSetAllocator, StandardDescriptorSetAllocatorCreateInfo};
 use vulkano::descriptor_set::layout::DescriptorType;
 use vulkano::device::physical::PhysicalDeviceType;
+use vulkano::image::sampler::{Filter, Sampler, SamplerAddressMode, SamplerCreateInfo};
 use vulkano::pipeline::graphics::viewport::{Viewport, ViewportState};
 use vulkano::pipeline::{DynamicState, GraphicsPipeline, Pipeline, PipelineBindPoint, PipelineLayout, PipelineShaderStageCreateInfo};
 use vulkano::pipeline::graphics::color_blend::{ColorBlendAttachmentState, ColorBlendState};
@@ -26,6 +28,8 @@ use vulkano::pipeline::graphics::multisample::MultisampleState;
 use vulkano::pipeline::graphics::rasterization::{PolygonMode, RasterizationState};
 use vulkano::pipeline::layout::{PipelineDescriptorSetLayoutCreateInfo};
 use vulkano::shader::EntryPoint;
+use crate::lm_bitmap::{Dimensions, LmPage};
+use crate::SpawnInfo;
 
 #[derive(BufferContents, Default, Copy, Clone)]
 #[repr(C, align(16))]
@@ -39,6 +43,7 @@ struct UniformData {
     pub spawn_count: u32,
     pub spawns: [SpawnData; 256],
     pub randoms_color: [f32; 4],
+    pub walkable_only: u32,
 }
 
 #[derive(BufferContents, Vertex)]
@@ -54,26 +59,26 @@ pub struct Vert {
     pub world_normal: [f32; 3],
 }
 
-pub struct Dimensions {
-    pub w: u16,
-    pub h: u16
-}
-
 pub struct LmRenderer {
     device: Arc<Device>,
     queue: Arc<Queue>,
     render_pass: Arc<RenderPass>,
     pipeline: Arc<GraphicsPipeline>,
-    descriptor_set: Arc<PersistentDescriptorSet>,
+    // descriptor_set: Arc<PersistentDescriptorSet>,
     memory_allocator: Arc<StandardMemoryAllocator>,
     command_buffer_allocator: Arc<StandardCommandBufferAllocator>,
+    descriptor_set_allocator: Arc<StandardDescriptorSetAllocator>,
+    //to bind
+    uniform_buffer: Subbuffer<UniformData>,
+    page_sampler: Arc<Sampler>,
 }
 
-// const OUTPUT_IMAGE_FORMAT: Format = Format::R8G8B8A8_UNORM;
+const OUTPUT_BYTES_PER_PIXEL: usize = 2; //16 bit
 const OUTPUT_IMAGE_FORMAT: Format = Format::R5G6B5_UNORM_PACK16;
+const OUTPUT_BITMAP_DATA_FORMAT: BitmapDataFormat = BitmapDataFormat::R5G6B5;
 
 impl LmRenderer {
-    pub fn init(spawns: Vec<[f32; 3]>, randoms_color: HexColor) -> LmRenderer {
+    pub fn init(spawns: &[SpawnInfo], randoms_color: HexColor, walkable_only: bool) -> LmRenderer {
         let library = VulkanLibrary::new().expect("No Vulkan library present");
         let instance = Instance::new(library, InstanceCreateInfo {
             flags: InstanceCreateFlags::ENUMERATE_PORTABILITY,
@@ -103,7 +108,7 @@ impl LmRenderer {
 
         let (device, mut queues) = Device::new(physical_device, DeviceCreateInfo {
             queue_create_infos: vec![QueueCreateInfo {
-                queue_family_index: queue_family_index,
+                queue_family_index,
                 ..Default::default()
             }],
             ..Default::default()
@@ -112,14 +117,21 @@ impl LmRenderer {
 
         let memory_allocator = Arc::new(StandardMemoryAllocator::new_default(device.clone()));
         let command_buffer_allocator = Arc::new(StandardCommandBufferAllocator::new(device.clone(), StandardCommandBufferAllocatorCreateInfo::default()));
-        let descriptor_set_allocator = StandardDescriptorSetAllocator::new(device.clone(), StandardDescriptorSetAllocatorCreateInfo::default());
+        let descriptor_set_allocator = Arc::new(StandardDescriptorSetAllocator::new(device.clone(), StandardDescriptorSetAllocatorCreateInfo::default()));
 
         let uniform_buffer = create_buffer(
-            create_uniform_data(&spawns, randoms_color),
+            create_uniform_data(spawns, randoms_color, walkable_only),
             BufferUsage::UNIFORM_BUFFER,
             MemoryTypeFilter::HOST_SEQUENTIAL_WRITE | MemoryTypeFilter::PREFER_DEVICE,
             memory_allocator.clone()
         );
+
+        let page_sampler = Sampler::new(device.clone(), SamplerCreateInfo {
+            mag_filter: Filter::Linear,
+            min_filter: Filter::Linear,
+            address_mode: [SamplerAddressMode::ClampToEdge; 3],
+            ..Default::default()
+        }).unwrap();
 
         let render_pass = vulkano::single_pass_renderpass!(
             device.clone(),
@@ -127,7 +139,7 @@ impl LmRenderer {
                 color: {
                     format: OUTPUT_IMAGE_FORMAT,
                     samples: 1,
-                    load_op: Clear,
+                    load_op: Load,
                     store_op: Store,
                 },
             },
@@ -151,6 +163,8 @@ impl LmRenderer {
         let layout = {
             let mut layout_create_info = PipelineDescriptorSetLayoutCreateInfo::from_stages(&stages);
             layout_create_info.set_layouts[0].bindings.get_mut(&0).unwrap().descriptor_type = DescriptorType::UniformBuffer;
+            layout_create_info.set_layouts[0].bindings.get_mut(&1).unwrap().descriptor_type = DescriptorType::Sampler;
+            layout_create_info.set_layouts[0].bindings.get_mut(&2).unwrap().descriptor_type = DescriptorType::SampledImage;
             PipelineLayout::new(
                 device.clone(),
                 layout_create_info
@@ -189,26 +203,20 @@ impl LmRenderer {
             ..GraphicsPipelineCreateInfo::layout(layout)
         }).expect("Failed to create graphics pipeline");
 
-        let descriptor_set_layout = pipeline.layout().set_layouts().get(0).unwrap();
-        let descriptor_set = PersistentDescriptorSet::new(
-            &descriptor_set_allocator,
-            descriptor_set_layout.clone(),
-            [WriteDescriptorSet::buffer(0, uniform_buffer)],
-            []
-        ).unwrap();
-
         LmRenderer {
             device,
             queue,
             render_pass,
             pipeline,
-            descriptor_set,
             memory_allocator,
             command_buffer_allocator,
+            descriptor_set_allocator,
+            uniform_buffer,
+            page_sampler,
         }
     }
 
-    pub fn render_randoms(&self, lm_verts: Vec<Vert>, lm_indices: Vec<u16>, dimensions: &Dimensions) -> Vec<u8> {
+    pub fn render_randoms(&self, lm_verts: Vec<Vert>, lm_indices: Vec<u16>, dimensions: Dimensions, original_lm_page: &LmPage) -> LmPage {
         let num_lm_indices = lm_indices.len() as u32;
 
         let vertex_buffer = create_buffer_iter(
@@ -224,11 +232,19 @@ impl LmRenderer {
             self.memory_allocator.clone()
         );
         let output_buffer = create_buffer_iter(
-            vec![0u8; dimensions.w as usize * dimensions.h as usize * 4],
+            vec![0u8; dimensions.w as usize * dimensions.h as usize * OUTPUT_BYTES_PER_PIXEL],
             BufferUsage::TRANSFER_DST,
             MemoryTypeFilter::HOST_RANDOM_ACCESS | MemoryTypeFilter::PREFER_HOST,
             self.memory_allocator.clone()
         );
+        let page_upload_buffer = create_buffer_iter(
+            original_lm_page.data.clone(),
+            BufferUsage::TRANSFER_SRC,
+            MemoryTypeFilter::HOST_SEQUENTIAL_WRITE | MemoryTypeFilter::PREFER_HOST,
+            self.memory_allocator.clone()
+        );
+        let page_image = create_page_img(self.memory_allocator.clone(), original_lm_page);
+        let page_view = ImageView::new_default(page_image.clone()).unwrap();
 
         let output_image = Image::new(
             self.memory_allocator.clone(),
@@ -236,7 +252,7 @@ impl LmRenderer {
                 image_type: ImageType::Dim2d,
                 format: OUTPUT_IMAGE_FORMAT,
                 extent: [dimensions.w as u32, dimensions.h as u32, 1],
-                usage: ImageUsage::COLOR_ATTACHMENT | ImageUsage::TRANSFER_SRC,
+                usage: ImageUsage::COLOR_ATTACHMENT | ImageUsage::TRANSFER_SRC | ImageUsage::TRANSFER_DST,
                 ..Default::default()
             },
             AllocationCreateInfo {
@@ -257,16 +273,35 @@ impl LmRenderer {
             depth_range: 0.0..=1.0,
         };
 
+        let descriptor_set_layout = self.pipeline.layout().set_layouts().get(0).unwrap();
+        let descriptor_set = PersistentDescriptorSet::new(
+            &self.descriptor_set_allocator,
+            descriptor_set_layout.clone(),
+            [
+                WriteDescriptorSet::buffer(0, self.uniform_buffer.clone()),
+                WriteDescriptorSet::sampler(1, self.page_sampler.clone()),
+                WriteDescriptorSet::image_view(2, page_view),
+            ],
+            []
+        ).unwrap();
+
         let mut command_buffer_builder = AutoCommandBufferBuilder::primary(
             &self.command_buffer_allocator,
             self.queue.queue_family_index(),
             CommandBufferUsage::OneTimeSubmit,
         ).unwrap();
 
+        let mut blit = BlitImageInfo::images(page_image.clone(), output_image.clone());
+        blit.filter = Filter::Linear;
+
         command_buffer_builder
+            .copy_buffer_to_image(CopyBufferToImageInfo::buffer_image(page_upload_buffer, page_image.clone()))
+            .unwrap()
+            .blit_image(blit)
+            .unwrap()
             .begin_render_pass(
                 RenderPassBeginInfo {
-                    clear_values: vec![Some([1.0, 1.0, 1.0, 1.0].into())],
+                    clear_values: vec![None],
                     ..RenderPassBeginInfo::framebuffer(framebuffer.clone())
                 },
                 SubpassBeginInfo {
@@ -287,7 +322,7 @@ impl LmRenderer {
                 PipelineBindPoint::Graphics,
                 self.pipeline.layout().clone(),
                 0,
-                self.descriptor_set.clone()
+                descriptor_set.clone()
             )
             .unwrap()
             .draw_indexed(num_lm_indices, 1, 0, 0, 0)
@@ -310,12 +345,16 @@ impl LmRenderer {
             .wait(None)
             .unwrap();
 
-        let result = output_buffer.read().unwrap().iter().cloned().collect();
-        result
+        let result_data: Vec<u8> = output_buffer.read().unwrap().iter().cloned().collect();
+        LmPage {
+            data: result_data,
+            data_format: OUTPUT_BITMAP_DATA_FORMAT,
+            dimensions: dimensions.clone(),
+        }
     }
 }
 
-fn create_uniform_data(spawns: &[[f32; 3]], randoms_color: HexColor) -> UniformData {
+fn create_uniform_data(spawns: &[SpawnInfo], randoms_color: HexColor, walkable_only: bool) -> UniformData {
     let mut data = UniformData {
         spawn_count: spawns.len() as u32,
         spawns: [SpawnData::default(); 256],
@@ -325,9 +364,14 @@ fn create_uniform_data(spawns: &[[f32; 3]], randoms_color: HexColor) -> UniformD
             (randoms_color.b as f32 / 255.0),
             (randoms_color.a as f32 / 255.0),
         ],
+        walkable_only: if walkable_only { 1 } else { 0 }
     };
     spawns.iter().enumerate().for_each(|(i, s)| {
-        data.spawns[i].world_pos = s.clone();
+        data.spawns[i].world_pos = [
+            s.position.x as f32,
+            s.position.y as f32,
+            s.position.z as f32,
+        ];
     });
     data
 }
@@ -369,4 +413,25 @@ fn create_buffer<T: BufferContents>(data: T, usage: BufferUsage, memory_type_fil
         AllocationCreateInfo { memory_type_filter, ..Default::default() },
         data,
     ).expect("Failed to create buffer")
+}
+
+fn create_page_img(allocator: Arc<dyn MemoryAllocator>, page: &LmPage) -> Arc<Image> {
+    let format: Format = match page.data_format {
+        BitmapDataFormat::R5G6B5 => Format::R5G6B5_UNORM_PACK16,
+        _ => panic!("The bitmap data format is not supported")
+    };
+    Image::new(
+        allocator,
+        ImageCreateInfo {
+            image_type: ImageType::Dim2d,
+            format,
+            extent: [page.dimensions.w as u32, page.dimensions.h as u32, 1],
+            usage: ImageUsage::TRANSFER_DST | ImageUsage::SAMPLED | ImageUsage::TRANSFER_SRC,
+            ..Default::default()
+        },
+        AllocationCreateInfo {
+            memory_type_filter: MemoryTypeFilter::PREFER_DEVICE,
+            ..Default::default()
+        }
+    ).expect("Failed to create image")
 }

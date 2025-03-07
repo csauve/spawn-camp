@@ -2,6 +2,7 @@
 
 layout(location = 0) in vec3 v_world_pos;
 layout(location = 1) in vec3 v_world_normal;
+layout(location = 2) in vec2 v_lm_uv;
 
 layout(location = 0) out vec4 f_color;
 
@@ -13,7 +14,10 @@ layout(set = 0, binding = 0, std140) uniform UniformData {
     uint spawn_count;
     SpawnData spawns[256];
     vec4 randoms_color;
+    uint walkable_only;
 } data;
+layout(set = 0, binding = 1) uniform sampler s;
+layout(set = 0, binding = 2) uniform texture2D lm_page;
 
 bool is_random() {
     for (uint i = 0; i < data.spawn_count; i++) {
@@ -26,15 +30,16 @@ bool is_random() {
     return true;
 }
 
-void main() {
-//    vec3 sun = normalize(vec3(0.0, 1.0, 1.0));
-//    float direct_light = clamp(dot(v_world_normal, sun), 0.0, 1.0);
-//    float light = direct_light + 0.2;
+bool mask() {
+    return data.walkable_only == 0 || dot(v_world_normal, vec3(0.0, 0.0, 1.0)) > 0.5;
+}
 
-    vec3 lm = vec3(1.0);
-    if (is_random()) {
-        lm = mix(lm, lm * vec3(data.randoms_color.rgb), data.randoms_color.a);
+void main() {
+    if (!is_random() || !mask()) {
+        discard;
     }
 
+    vec3 lm = texture(sampler2D(lm_page, s), v_lm_uv).rgb;
+    lm = mix(lm, lm * vec3(data.randoms_color.rgb), data.randoms_color.a);
     f_color = vec4(lm, 1.0);
 }

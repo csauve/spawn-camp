@@ -1,21 +1,25 @@
-mod render;
+mod lm_render;
+mod lm_bitmap;
 
 use std::process::ExitCode;
 use std::str::FromStr;
-use ringhopper::definitions::{
-    Scenario, ScenarioSpawnType, ScenarioStructureBSP, Bitmap, BitmapType, BitmapFormat, BitmapUsage,
-    BitmapGroupSequence, BitmapData, BitmapDataType, BitmapDataFormat, BitmapDataFlags
-};
-use ringhopper::primitives::primitive::{Data, Reflexive, TagGroup, TagPath, TagReference, Vector2DInt};
+use ringhopper::definitions::{Scenario, ScenarioSpawnType, ScenarioStructureBSP, Bitmap, ScenarioSceneryPalette, ScenarioScenery, ScenarioObjectPlacement};
+use ringhopper::primitives::primitive::{Angle, Euler3D, Index, TagGroup, TagPath, TagReference, Vector3D};
 use ringhopper::error::Error as RinghopperError;
 use ringhopper::tag::scenario_structure_bsp::get_uncompressed_vertices_for_bsp_material;
 use ringhopper::tag::tree::{TagTree, VirtualTagsDirectory};
 use clap::{Arg, ArgAction, ArgMatches, Command};
 use clap::builder::{Styles};
 use clap::{builder::styling};
-use colored::{Colorize};
 use hex_color::HexColor;
-use crate::render::{Dimensions, LmRenderer, Vert};
+use ringhopper::primitives::tag::PrimaryTagStructDyn;
+use crate::lm_bitmap::{create_lm_bitmap, get_lm_page, Dimensions, LmPage};
+use crate::lm_render::{LmRenderer, Vert};
+
+struct SpawnInfo {
+    position: Vector3D,
+    facing: Angle,
+}
 
 fn main() -> ExitCode {
     let result = run_with_args(Command::new("spawn-camp")
@@ -57,8 +61,8 @@ fn main() -> ExitCode {
             .long("scale")
             .short('s')
             .help("Scale for the randoms lightmap compared to Tool's lightmap. Higher scale results in sharper randoms, but increases the tag size.")
-            .default_value("2")
-            .value_parser(["1", "2", "4", "8"])
+            .default_value("4")
+            .value_parser(["1", "2", "4", "8", "16"])
         )
         .arg(Arg::new("randoms-color")
             .value_name("hex-code")
@@ -67,16 +71,22 @@ fn main() -> ExitCode {
             .help("Color to render randoms in the lightmap. Supports RGB(A) hex codes like: #FF00FF, #0FF, #DDA0DD80 (alpha controls multiply opacity)")
             .default_value("#FF000080")
         )
+        .arg(Arg::new("walkable")
+            .long("walkable")
+            .short('w')
+            .help("If provided, only walkable surfaces up to 45 degrees steepness will be shaded with the randoms color.")
+            .action(ArgAction::SetTrue)
+        )
         .get_matches()
     );
 
     match result {
         Ok(message) => {
-            println!("{}", message.green());
+            println!("{}", message);
             ExitCode::SUCCESS
         },
         Err(message) => {
-            eprintln!("{}", message.red());
+            eprintln!("ERROR: {}", message);
             ExitCode::FAILURE
         },
     }
@@ -89,59 +99,140 @@ fn run_with_args(matches: ArgMatches) -> Result<String, String> {
     let marker_tag_path = parse_tag_path(matches.get_one::<String>("marker-tag-path").unwrap(), TagGroup::Scenery)?;
     let lm_scale = u16::from_str(matches.get_one::<String>("lm-scale").unwrap()).unwrap();
     let randoms_color = parse_hex_code(matches.get_one::<String>("randoms-color").unwrap())?;
+    let walkable_only = matches.get_flag("walkable");
+
+    let mut tags = VirtualTagsDirectory::new(&[tags_dir], None).map_err(display_ringhopper_err)?;
 
     if reset {
-        run_reset(tags_dir)
+        run_reset(&mut tags, &scenario_tag_path, &marker_tag_path)
     } else {
-        run_spawns(tags_dir, &scenario_tag_path, lm_scale, randoms_color)
+        run_spawns(&mut tags, &scenario_tag_path, lm_scale, randoms_color, walkable_only, &marker_tag_path)
     }
 }
 
-fn run_reset(tags_dir: &str) -> Result<String, String> {
+fn run_reset(tags: &mut VirtualTagsDirectory, scenario_tag_path: &TagPath, marker_tag_path: &TagPath) -> Result<String, String> {
+    let mut scenario_tag = tags.open_tag_copy(&scenario_tag_path).map_err(display_ringhopper_err)?;
+    let scenario = scenario_tag.get_mut::<Scenario>().unwrap();
+
+    if let Some(bsp_tag_path) = scenario.structure_bsps.items.get(0).and_then(|scnr_bsp| scnr_bsp.structure_bsp.path()) {
+        let original_lm_tag_path = get_original_lm_tag_path(&bsp_tag_path);
+        println!("Resetting BSP lightmap reference to {}", original_lm_tag_path);
+        let mut bsp_tag = tags.open_tag_copy(bsp_tag_path).map_err(display_ringhopper_err)?;
+        let bsp = bsp_tag.get_mut::<ScenarioStructureBSP>().unwrap();
+        bsp.lightmaps_bitmap = TagReference::Set(original_lm_tag_path);
+        write_tag(tags, bsp_tag_path, bsp)?;
+    }
+
+    if let Some(marker_palette_index) = get_marker_palette(scenario, marker_tag_path) {
+        println!("Removing marker palette entry and scenery placements");
+        remove_all_markers(scenario, marker_palette_index);
+        remove_marker_palette(scenario, marker_palette_index);
+        write_tag(tags, scenario_tag_path, scenario)?;
+    }
+
     Ok("Scenario reset successfully".into())
 }
 
-fn run_spawns(tags_dir: &str, scenario_tag_path: &TagPath, lm_scale: u16, randoms_color: HexColor) -> Result<String, String> {
-    let mut tags = VirtualTagsDirectory::new(&[tags_dir], None).map_err(display_ringhopper_err)?;
-
-    let scenario_tag = tags.open_tag_copy(&scenario_tag_path).map_err(display_ringhopper_err)?;
-    let scenario = scenario_tag.get_ref::<Scenario>().unwrap();
-
-    let bsp_tag_path = scenario.structure_bsps.items.get(0).ok_or("The scenario has no BSP")
-        ?.structure_bsp.path().ok_or("The scenario's BSP tag path is empty")?;
+fn run_spawns(tags: &mut VirtualTagsDirectory, scenario_tag_path: &TagPath, lm_scale: u16, randoms_color: HexColor, walkable_only: bool, marker_tag_path: &TagPath) -> Result<String, String> {
+    let mut scenario_tag = tags.open_tag_copy(&scenario_tag_path).map_err(display_ringhopper_err)?;
+    let scenario = scenario_tag.get_mut::<Scenario>().unwrap();
 
     let slayer_spawns = get_slayer_spawns(scenario);
-
-    generate_randoms(&mut tags, slayer_spawns, bsp_tag_path, lm_scale, randoms_color)?;
-
+    generate_randoms(tags, &slayer_spawns, scenario, lm_scale, randoms_color, walkable_only)?;
+    place_spawn_markers(tags, &slayer_spawns, scenario, marker_tag_path)?;
+    write_tag(tags, scenario_tag_path, scenario)?;
 
     Ok("Spawns added successfully".into())
 }
 
-fn generate_randoms(tags: &mut VirtualTagsDirectory, slayer_spawns: Vec<[f32; 3]>, bsp_tag_path: &TagPath, scale: u16, randoms_color: HexColor) -> Result<(), String> {
-    println!("{}", format!("Generating randoms for BSP {} ", bsp_tag_path).bright_blue());
-    let renderer = LmRenderer::init(slayer_spawns, randoms_color);
+fn place_spawn_markers(tags: &mut VirtualTagsDirectory, slayer_spawns: &[SpawnInfo], scenario: &mut Scenario, marker_tag_path: &TagPath) -> Result<(), String> {
+    tags.open_tag_copy(marker_tag_path).map_err(|_|
+        format!("No marker scenery tag exists at path {}. You can get it from https://github.com/khstarr/h1-spawn-tools", marker_tag_path)
+    )?;
+
+    let marker_palette_index = match get_marker_palette(scenario, marker_tag_path) {
+        Some(index) => {
+            println!("Removing existing markers");
+            remove_all_markers(scenario, index);
+            index
+        },
+        None => {
+            println!("Adding scenery palette entry {}", marker_tag_path);
+            scenario.scenery_palette.items.push(ScenarioSceneryPalette {
+                name: TagReference::Set(marker_tag_path.clone())
+            });
+            Some(scenario.scenery_palette.items.len() as u16 - 1)
+        }
+    };
+
+    println!("Placing {} spawn markers", slayer_spawns.len());
+    scenario.scenery.items.extend(slayer_spawns.iter().map(|spawn| {
+        ScenarioScenery {
+            _type: marker_palette_index,
+            name: None,
+            placement: ScenarioObjectPlacement {
+                position: spawn.position,
+                rotation: Euler3D {
+                    yaw: spawn.facing,
+                    pitch: Angle::default(),
+                    roll: Angle::default(),
+                },
+                ..ScenarioObjectPlacement::default()
+            },
+            ..ScenarioScenery::default()
+        }
+    }));
+
+    Ok(())
+}
+
+fn get_marker_palette(scenario: &Scenario, marker_tag_path: &TagPath) -> Option<Index> {
+    scenario.scenery_palette.items.iter()
+        .position(|palette_entry| palette_entry.name.path().map(|tag_path| tag_path.eq(marker_tag_path)).unwrap_or(false))
+        .map(|i| Some(i as u16))
+}
+
+fn remove_all_markers(scenario: &mut Scenario, marker_palette_index: Index) {
+    scenario.scenery.items = scenario.scenery.items.iter()
+        .filter(|scenery| scenery._type != marker_palette_index)
+        .cloned()
+        .collect();
+}
+
+fn remove_marker_palette(scenario: &mut Scenario, marker_palette_index: Index) {
+    if let Some(i) = marker_palette_index {
+        scenario.scenery_palette.items.remove(i as usize);
+    }
+}
+
+fn generate_randoms(tags: &mut VirtualTagsDirectory, slayer_spawns: &[SpawnInfo], scenario: &Scenario, scale: u16, randoms_color: HexColor, walkable_only: bool) -> Result<(), String> {
+    let bsp_tag_path = scenario.structure_bsps.items.get(0).ok_or("The scenario has no BSP")
+        ?.structure_bsp.path().ok_or("The scenario's BSP tag path is empty")?;
+
+    println!("Generating randoms for BSP {} ", bsp_tag_path);
+    let renderer = LmRenderer::init(slayer_spawns, randoms_color, walkable_only);
 
     let mut bsp_tag = tags.open_tag_copy(bsp_tag_path).map_err(display_ringhopper_err)?;
     let bsp = bsp_tag.get_mut::<ScenarioStructureBSP>().unwrap();
-    let original_lm_tag_path = get_original_lm_tag_path(&bsp_tag_path);
 
-    //base the output dimensions on the original lightmap's dimensions
+    let original_lm_tag_path = get_original_lm_tag_path(&bsp_tag_path);
     let original_lm_tag = tags.open_tag_copy(&original_lm_tag_path).unwrap();
     let original_lm = original_lm_tag.get_ref::<Bitmap>().unwrap();
-    let output_dimensions: Vec<Dimensions> = original_lm.bitmap_data.items.iter().map(|prev_lm_bitmap_data| {
-        Dimensions {
-            w: prev_lm_bitmap_data.width * scale,
-            h: prev_lm_bitmap_data.height * scale,
-        }
-    }).collect();
 
-    let output_bitmap_data: Vec<Vec<u8>> = bsp.lightmaps.items.iter().enumerate().filter_map(|(i_lightmap, lightmap)| {
-        lightmap.bitmap.map(|lm_bitmap_index| {
+    let output_pages: Vec<LmPage> = bsp.lightmaps.items.iter().filter_map(|bsp_lightmap| {
+        bsp_lightmap.bitmap.map(|lm_bitmap_index| {
             let mut verts: Vec<Vert> = Vec::new();
             let mut indices: Vec<u16> = Vec::new();
 
-            lightmap.materials.items.iter().for_each(|material| {
+            //base the output dimensions on the original lightmap's dimensions
+            let output_dimensions = original_lm.bitmap_data.items.get(lm_bitmap_index as usize).map(|prev_lm_bitmap_data| {
+                Dimensions {
+                    w: prev_lm_bitmap_data.width * scale,
+                    h: prev_lm_bitmap_data.height * scale,
+                }
+            }).unwrap();
+
+            bsp_lightmap.materials.items.iter().for_each(|material| {
                 let (rendered_verts, lm_verts) = get_uncompressed_vertices_for_bsp_material(material).unwrap();
                 let rendered_verts = rendered_verts.collect::<Vec<_>>();
 
@@ -181,71 +272,37 @@ fn generate_randoms(tags: &mut VirtualTagsDirectory, slayer_spawns: Vec<[f32; 3]
                 );
             });
 
-            println!("Rendering lightmap {} with {} verts", i_lightmap, verts.len());
-            let dimensions = output_dimensions.get(lm_bitmap_index as usize).unwrap();
-            renderer.render_randoms(verts, indices, dimensions)
+            println!("Rendering lightmap {} with {} verts [{}x{}]", lm_bitmap_index, verts.len(), output_dimensions.w, output_dimensions.h);
+            let original_lm_page = get_lm_page(original_lm, lm_bitmap_index).unwrap();
+            renderer.render_randoms(verts, indices, output_dimensions, &original_lm_page)
         })
     }).collect();
 
+    println!("Assembling LM bitmap");
     let output_lm_tag_path = get_output_lm_tag_path(bsp_tag_path);
-    println!("Writing bitmap {}", output_lm_tag_path);
-    let pixel_data: Vec<u8> = output_bitmap_data.iter().flatten().map(|&v| v).collect();
-    let bitmap = Bitmap {
-        _type: BitmapType::_2dTextures,
-        encoding_format: BitmapFormat::_16Bit,
-        usage: BitmapUsage::LightMap,
-        processed_pixel_data: Data::new(pixel_data),
-        bitmap_group_sequence: Reflexive::new((0..output_bitmap_data.len()).map(|i| {
-            BitmapGroupSequence {
-                bitmap_count: 1,
-                first_bitmap_index: Some(i as u16),
-                ..BitmapGroupSequence::default()
-            }
-        }).collect()),
-        bitmap_data: Reflexive::new(output_bitmap_data.iter().enumerate().map(|(lm_bitmap_index, output_lightmap_data)| {
-            let dimensions = output_dimensions.get(lm_bitmap_index).unwrap();
-            BitmapData {
-                signature: TagGroup::Bitmap,
-                width: dimensions.w,
-                height: dimensions.h,
-                depth: 1,
-                _type: BitmapDataType::_2dTexture,
-                format: BitmapDataFormat::R5G6B5, //matches renderer OUTPUT_IMAGE_FORMAT
-                flags: BitmapDataFlags {
-                    power_of_two_dimensions: true,
-                    ..BitmapDataFlags::default()
-                },
-                registration_point: Vector2DInt {
-                    x: (dimensions.w / 2) as i16,
-                    y: (dimensions.h / 2) as i16,
-                },
-                mipmap_count: 0,
-                pixel_data_offset: (0..lm_bitmap_index)
-                    .map(|i| output_bitmap_data[i].len() as u32)
-                    .sum(),
-                ..BitmapData::default()
-            }
-        }).collect()),
-        ..Bitmap::default()
-    };
-
-    tags.write_tag(&output_lm_tag_path, &bitmap).map_err(display_ringhopper_err)?;
+    let output_lm = create_lm_bitmap(&output_pages);
+    write_tag(tags, &output_lm_tag_path, &output_lm)?;
 
     println!("Updating BSP lightmap bitmap reference");
     bsp.lightmaps_bitmap = TagReference::Set(output_lm_tag_path);
-    tags.write_tag(bsp_tag_path, bsp).map_err(display_ringhopper_err)?;
+    write_tag(tags, bsp_tag_path, bsp)?;
 
     Ok(())
 }
 
-fn get_slayer_spawns(scenario: &Scenario) -> Vec<[f32; 3]> {
+fn write_tag(tags: &mut VirtualTagsDirectory, tag_path: &TagPath, tag: &dyn PrimaryTagStructDyn) -> Result<(), String> {
+    println!("Writing tag {}", tag_path);
+    tags.write_tag(tag_path, tag).map_err(display_ringhopper_err)?;
+    Ok(())
+}
+
+fn get_slayer_spawns(scenario: &Scenario) -> Vec<SpawnInfo> {
     scenario.player_starting_locations.items.iter().filter_map(|loc| {
         if is_slayer_spawn(loc.type_0) || is_slayer_spawn(loc.type_1) || is_slayer_spawn(loc.type_2) || is_slayer_spawn(loc.type_3) {
-            Some([
-                loc.position.x as f32,
-                loc.position.y as f32,
-                loc.position.z as f32
-            ])
+            Some(SpawnInfo {
+                position: loc.position,
+                facing: loc.facing,
+            })
         } else {
             None
         }
