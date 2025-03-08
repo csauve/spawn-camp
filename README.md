@@ -46,3 +46,6 @@ spawn-camp levels\test\hangemhigh\hangemhigh --color 00f --scale 8 -w
 * [h1-spawn-tools](https://github.com/khstarr/h1-spawn-tools) by insidi0us
 * Spawn marker scenery by stunt_man
 * [Vulkano](https://github.com/vulkano-rs/vulkano) project for Vulkan wrapper
+
+## License
+GPL v3
