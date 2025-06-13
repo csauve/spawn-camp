@@ -202,6 +202,15 @@ fn remove_all_markers(scenario: &mut Scenario, marker_palette_index: Index) {
 fn remove_marker_palette(scenario: &mut Scenario, marker_palette_index: Index) {
     if let Some(i) = marker_palette_index {
         scenario.scenery_palette.items.remove(i as usize);
+
+        //any scenery using a palette index greater than i needs to be reduced
+        scenario.scenery.items.iter_mut().for_each(|scenery| {
+            if let Some(scenery_type) = scenery._type {
+                if scenery_type > i {
+                    scenery._type = Some(scenery_type - 1);
+                }
+            }
+        });
     }
 }
 
