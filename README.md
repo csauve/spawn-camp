@@ -31,9 +31,10 @@ Various additional options are available:
 * `-t, --tags <path>`: Path to the base tags directory. Defaults to `tags`.
 * `-m, --marker <tag-path>`: Tag path for the spawn marker scenery. Defaults to `scenery\spawn_marker_nhe\spawn_marker_nhe`.
 * `-s, --scale <num>`: Scale for the randoms lightmap compared to Tool's lightmap. Possible values: 1, 2, 4, 8, 16. Defaults to 4. Maps intended for port to Xbox should use 1.
-* `-c, --color <hex-code>` RGB(A) hex code for the randoms color. Examples: `FF00FF`, `0FF`, `DDA0DD80`. Defaults to `FF000080`.
+* `-c, --color <hex-code>`: RGB(A) hex code for the randoms color. Examples: `FF00FF`, `0FF`, `DDA0DD80`. Defaults to `FF000080`. The optional opacity controls how much the overlay affects the lightmap.
+* `-b, --blend <mode>`: Blending mode for randoms over the lightmap, either `normal` or `multiply` (default). Normal may work better in dark maps where you wish the randoms to "glow" in the dark. 
 * `-w, --walkable`: If provided, only walkable surfaces up to 45 degrees steepness will be shaded with the randoms color.
-* `-h, --help` Prints a summary of arguments and options.
+* `-h, --help`: Prints a summary of arguments and options.
 
 For example, to render blue randoms on walkable surfaces with 8x resolution:
 

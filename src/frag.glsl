@@ -14,6 +14,7 @@ layout(set = 0, binding = 0, std140) uniform UniformData {
     uint spawn_count;
     SpawnData spawns[256];
     vec4 randoms_color;
+    uint blend_mode;
     uint walkable_only;
 } data;
 layout(set = 0, binding = 1) uniform sampler s;
@@ -40,6 +41,14 @@ void main() {
     }
 
     vec3 lm = texture(sampler2D(lm_page, s), v_lm_uv).rgb;
-    lm = mix(lm, lm * vec3(data.randoms_color.rgb), data.randoms_color.a);
+
+    //normal
+    vec3 blended = data.randoms_color.rgb;
+    if (data.blend_mode == 1) {
+        //multiply
+        blended = lm * vec3(data.randoms_color.rgb);
+    }
+
+    lm = mix(lm, blended, data.randoms_color.a);
     f_color = vec4(lm, 1.0);
 }

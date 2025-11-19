@@ -14,7 +14,7 @@ use clap::{builder::styling};
 use hex_color::HexColor;
 use ringhopper::primitives::tag::PrimaryTagStructDyn;
 use crate::lm_bitmap::{create_lm_bitmap, get_lm_page, Dimensions, LmPage};
-use crate::lm_render::{LmRenderer, Vert};
+use crate::lm_render::{BlendMode, LmRenderer, Vert};
 
 struct SpawnInfo {
     position: Vector3D,
@@ -68,8 +68,16 @@ fn main() -> ExitCode {
             .value_name("hex-code")
             .long("color")
             .short('c')
-            .help("Color to render randoms in the lightmap. Supports RGB(A) hex codes like: #FF00FF, #0FF, #DDA0DD80 (alpha controls multiply opacity)")
+            .help("Color to render randoms in the lightmap. Supports RGB(A) hex codes like: #FF00FF, #0FF, #DDA0DD80 (alpha controls opacity).")
             .default_value("#FF000080")
+        )
+        .arg(Arg::new("blend")
+            .value_name("mode")
+            .long("blend")
+            .short('b')
+            .help("Color blend mode for the randoms overlay over the original lightmap.")
+            .default_value("multiply")
+            .value_parser(["normal", "multiply"])
         )
         .arg(Arg::new("walkable")
             .long("walkable")
@@ -99,6 +107,7 @@ fn run_with_args(matches: ArgMatches) -> Result<String, String> {
     let marker_tag_path = parse_tag_path(matches.get_one::<String>("marker-tag-path").unwrap(), TagGroup::Scenery)?;
     let lm_scale = u16::from_str(matches.get_one::<String>("lm-scale").unwrap()).unwrap();
     let randoms_color = parse_hex_code(matches.get_one::<String>("randoms-color").unwrap())?;
+    let blend_mode = parse_blend_mode(matches.get_one::<String>("blend").unwrap())?;
     let walkable_only = matches.get_flag("walkable");
 
     let mut tags = VirtualTagsDirectory::new(&[tags_dir], None).map_err(display_ringhopper_err)?;
@@ -106,7 +115,7 @@ fn run_with_args(matches: ArgMatches) -> Result<String, String> {
     if reset {
         run_reset(&mut tags, &scenario_tag_path, &marker_tag_path)
     } else {
-        run_spawns(&mut tags, &scenario_tag_path, lm_scale, randoms_color, walkable_only, &marker_tag_path)
+        run_spawns(&mut tags, &scenario_tag_path, lm_scale, randoms_color, blend_mode, walkable_only, &marker_tag_path)
     }
 }
 
@@ -133,12 +142,12 @@ fn run_reset(tags: &mut VirtualTagsDirectory, scenario_tag_path: &TagPath, marke
     Ok("Scenario reset successfully".into())
 }
 
-fn run_spawns(tags: &mut VirtualTagsDirectory, scenario_tag_path: &TagPath, lm_scale: u16, randoms_color: HexColor, walkable_only: bool, marker_tag_path: &TagPath) -> Result<String, String> {
+fn run_spawns(tags: &mut VirtualTagsDirectory, scenario_tag_path: &TagPath, lm_scale: u16, randoms_color: HexColor, blend_mode: BlendMode, walkable_only: bool, marker_tag_path: &TagPath) -> Result<String, String> {
     let mut scenario_tag = tags.open_tag_copy(&scenario_tag_path).map_err(display_ringhopper_err)?;
     let scenario = scenario_tag.get_mut::<Scenario>().unwrap();
 
     let slayer_spawns = get_slayer_spawns(scenario);
-    generate_randoms(tags, &slayer_spawns, scenario, lm_scale, randoms_color, walkable_only)?;
+    generate_randoms(tags, &slayer_spawns, scenario, lm_scale, randoms_color, blend_mode, walkable_only)?;
     place_spawn_markers(tags, &slayer_spawns, scenario, marker_tag_path)?;
     write_tag(tags, scenario_tag_path, scenario)?;
 
@@ -214,12 +223,12 @@ fn remove_marker_palette(scenario: &mut Scenario, marker_palette_index: Index) {
     }
 }
 
-fn generate_randoms(tags: &mut VirtualTagsDirectory, slayer_spawns: &[SpawnInfo], scenario: &Scenario, scale: u16, randoms_color: HexColor, walkable_only: bool) -> Result<(), String> {
+fn generate_randoms(tags: &mut VirtualTagsDirectory, slayer_spawns: &[SpawnInfo], scenario: &Scenario, scale: u16, randoms_color: HexColor, blend_mode: BlendMode, walkable_only: bool) -> Result<(), String> {
     let bsp_tag_path = scenario.structure_bsps.items.get(0).ok_or("The scenario has no BSP")
         ?.structure_bsp.path().ok_or("The scenario's BSP tag path is empty")?;
 
     println!("Generating randoms for BSP {} ", bsp_tag_path);
-    let renderer = LmRenderer::init(slayer_spawns, randoms_color, walkable_only);
+    let renderer = LmRenderer::init(slayer_spawns, randoms_color, blend_mode, walkable_only);
 
     let mut bsp_tag = tags.open_tag_copy(bsp_tag_path).map_err(display_ringhopper_err)?;
     let bsp = bsp_tag.get_mut::<ScenarioStructureBSP>().unwrap();
@@ -348,6 +357,14 @@ fn parse_hex_code(raw: &str) -> Result<HexColor, String> {
         format!("#{raw}")
     };
     HexColor::parse(&prefixed).map_err(|_| format!("Not a valid hex color code: {}", raw))
+}
+
+fn parse_blend_mode(raw: &str) -> Result<BlendMode, String> {
+    match raw.to_ascii_lowercase().as_str() {
+        "normal" => Ok(BlendMode::Normal),
+        "multiply" => Ok(BlendMode::Multiply),
+        _ => Err(format!("Not a valid blend mode: {}", raw)),
+    }
 }
 
 fn display_ringhopper_err(err: RinghopperError) -> String {

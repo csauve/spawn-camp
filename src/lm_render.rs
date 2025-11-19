@@ -31,6 +31,11 @@ use vulkano::shader::EntryPoint;
 use crate::lm_bitmap::{Dimensions, LmPage};
 use crate::SpawnInfo;
 
+pub enum BlendMode {
+    Normal = 0,
+    Multiply = 1,
+}
+
 #[derive(BufferContents, Default, Copy, Clone)]
 #[repr(C, align(16))]
 struct SpawnData {
@@ -43,6 +48,7 @@ struct UniformData {
     pub spawn_count: u32,
     pub spawns: [SpawnData; 256],
     pub randoms_color: [f32; 4],
+    pub blend_mode: u32,
     pub walkable_only: u32,
 }
 
@@ -78,7 +84,7 @@ const OUTPUT_IMAGE_FORMAT: Format = Format::R5G6B5_UNORM_PACK16;
 const OUTPUT_BITMAP_DATA_FORMAT: BitmapDataFormat = BitmapDataFormat::R5G6B5;
 
 impl LmRenderer {
-    pub fn init(spawns: &[SpawnInfo], randoms_color: HexColor, walkable_only: bool) -> LmRenderer {
+    pub fn init(spawns: &[SpawnInfo], randoms_color: HexColor, blend_mode: BlendMode, walkable_only: bool) -> LmRenderer {
         let library = VulkanLibrary::new().expect("No Vulkan library present");
         let instance = Instance::new(library, InstanceCreateInfo {
             flags: InstanceCreateFlags::ENUMERATE_PORTABILITY,
@@ -120,7 +126,7 @@ impl LmRenderer {
         let descriptor_set_allocator = Arc::new(StandardDescriptorSetAllocator::new(device.clone(), StandardDescriptorSetAllocatorCreateInfo::default()));
 
         let uniform_buffer = create_buffer(
-            create_uniform_data(spawns, randoms_color, walkable_only),
+            create_uniform_data(spawns, randoms_color, blend_mode, walkable_only),
             BufferUsage::UNIFORM_BUFFER,
             MemoryTypeFilter::HOST_SEQUENTIAL_WRITE | MemoryTypeFilter::PREFER_DEVICE,
             memory_allocator.clone()
@@ -354,7 +360,7 @@ impl LmRenderer {
     }
 }
 
-fn create_uniform_data(spawns: &[SpawnInfo], randoms_color: HexColor, walkable_only: bool) -> UniformData {
+fn create_uniform_data(spawns: &[SpawnInfo], randoms_color: HexColor, blend_mode: BlendMode, walkable_only: bool) -> UniformData {
     let mut data = UniformData {
         spawn_count: spawns.len() as u32,
         spawns: [SpawnData::default(); 256],
@@ -364,6 +370,7 @@ fn create_uniform_data(spawns: &[SpawnInfo], randoms_color: HexColor, walkable_o
             (randoms_color.b as f32 / 255.0),
             (randoms_color.a as f32 / 255.0),
         ],
+        blend_mode: blend_mode as u32,
         walkable_only: if walkable_only { 1 } else { 0 }
     };
     spawns.iter().enumerate().for_each(|(i, s)| {
